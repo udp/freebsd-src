@@ -54,6 +54,8 @@ __FBSDID("$FreeBSD$");
 #include <sys/syslog.h>
 #include <sys/un.h>
 #include <sys/unistd.h>
+#include <sys/protosw.h>
+#include <sys/vnode.h>
 
 #include <security/audit/audit.h>
 
@@ -1978,6 +1980,151 @@ out:
 	return (error);
 }
 
+/*
+ * Based on sendfile_getsock from kern_sendfile.c
+ * Determines whether an fd is a stream socket that can be used
+ * with FreeBSD sendfile.
+ */
+static bool
+_is_stream_socket(struct thread *td, l_int fd)
+{
+	int error;
+	struct file *sock_fp = NULL;
+	struct socket *so = NULL;
+
+	/*
+	 * The socket must be a stream socket and connected.
+	 */
+	error = getsock_cap(td, fd, &cap_send_rights,
+	    &sock_fp, NULL, NULL);
+	if (error != 0)
+		return false;
+	so = sock_fp->f_data;
+	if (so->so_type != SOCK_STREAM)
+		return false;
+	/*
+	 * SCTP one-to-one style sockets currently don't work with
+	 * sendfile().
+	 */
+	if (so->so_proto->pr_protocol == IPPROTO_SCTP)
+		return false;
+	if (SOLISTENING(so))
+		return false;
+
+	return true;
+}
+
+#define TMPBUF_SIZE 8192
+
+static int
+_sendfile_fallback(struct thread *td, struct file *fp,
+	struct file *outfp, l_loff_t current_offset,
+	l_size_t count, off_t *bytes_read) 
+{
+	int error;
+	struct uio auio;
+	struct iovec aiov;
+	void *tmpbuf;
+	off_t out_offset;
+	l_size_t bytes_sent;
+	l_size_t n_read;
+
+	error = (outfp->f_ops->fo_flags & DFLAG_SEEKABLE) != 0 ?
+			fo_seek(outfp, 0, SEEK_CUR, td) : 0;
+
+	if (error != 0)
+		return (error);
+
+	out_offset = td->td_uretoff.tdu_off;
+	uprintf("out_offset is %d\n", (int) out_offset);
+
+	bytes_sent = 0;
+	tmpbuf = malloc(TMPBUF_SIZE, M_TEMP, M_WAITOK);
+
+	if(!tmpbuf) {
+		error = ENOMEM;
+		return (error);
+	}
+
+	while(bytes_sent < count) {
+
+		off_t to_send = MIN(count - bytes_sent, TMPBUF_SIZE);
+
+		uprintf("count %d\n", (int) count);
+		uprintf("to_send %d\n", (int) to_send);
+		uprintf("bytes_sent %d\n", (int) bytes_sent);
+		uprintf("current_offset %d\n", (int) current_offset);
+
+		/*
+		 * Read
+		 */
+
+		aiov.iov_base = tmpbuf;
+		aiov.iov_len = TMPBUF_SIZE;
+
+		auio.uio_iov = &aiov;
+		auio.uio_iovcnt = 1;
+		auio.uio_segflg = UIO_SYSSPACE;
+		auio.uio_td = td;
+
+		auio.uio_rw = UIO_READ;
+		auio.uio_offset = current_offset + bytes_sent;
+		auio.uio_resid = to_send;
+
+		error = fo_read(fp, &auio, fp->f_cred, FOF_OFFSET, td);
+		if (error != 0) {
+			uprintf("fo_read failed\n");
+			goto cleanup;
+		}
+
+		n_read = to_send - auio.uio_resid;
+
+		if(n_read == 0)
+			break; /* eof */
+
+		/*
+		 * Write
+		 */
+
+		aiov.iov_base = tmpbuf;
+		aiov.iov_len = TMPBUF_SIZE;
+
+		auio.uio_iov = &aiov;
+		auio.uio_iovcnt = 1;
+		auio.uio_segflg = UIO_SYSSPACE;
+		auio.uio_td = td;
+
+		auio.uio_rw = UIO_WRITE;
+
+		auio.uio_offset = ((outfp->f_ops->fo_flags & DFLAG_SEEKABLE) != 0) ?
+			out_offset + bytes_sent :
+			0;
+
+		auio.uio_resid = n_read;
+
+		error = fo_write(outfp, &auio, outfp->f_cred, FOF_OFFSET, td);
+		if (error != 0) {
+			uprintf("fo_write failed\n");
+			goto cleanup;
+		}
+
+		bytes_sent += n_read;
+	}
+
+	if((outfp->f_ops->fo_flags & DFLAG_SEEKABLE) != 0) {
+		error = fo_seek(outfp, out_offset + bytes_sent, SEEK_SET, td);
+		if (error != 0) {
+			uprintf("fo_seek failed\n");
+			goto cleanup;
+		}
+	}
+
+cleanup:
+	*bytes_read = bytes_sent;
+	free(tmpbuf, M_TEMP);
+	return (error);
+}
+
 static int
 linux_sendfile_common(struct thread *td, l_int out, l_int in,
     l_loff_t *offset, l_size_t count)
@@ -1985,12 +2132,17 @@ linux_sendfile_common(struct thread *td, l_int out, l_int in,
 	off_t bytes_read;
 	int error;
 	l_loff_t current_offset;
-	struct file *fp;
+	struct file *fp, *outfp;
+	bool use_sendfile;
 
 	AUDIT_ARG_FD(in);
 	error = fget_read(td, in, &cap_pread_rights, &fp);
 	if (error != 0)
 		return (error);
+
+	use_sendfile = _is_stream_socket(td, out) &&
+	    ((fp->f_type == DTYPE_VNODE && fp->f_vnode->v_type == VREG) ||
+		fp->f_type == DTYPE_SHM);
 
 	if (offset != NULL) {
 		current_offset = *offset;
@@ -2010,10 +2162,22 @@ linux_sendfile_common(struct thread *td, l_int out, l_int in,
 		goto drop;
 	}
 
-	error = fo_sendfile(fp, out, NULL, NULL, current_offset, count,
-	    &bytes_read, 0, td);
-	if (error != 0)
+	if(use_sendfile) {
+		error = fo_sendfile(fp, out, NULL, NULL, current_offset, count,
+			&bytes_read, 0, td);
+	} else {
+		error = fget_write(td, out, &cap_pwrite_rights, &outfp);
+		if (error != 0)
+			return (error);
+		error = _sendfile_fallback(td, fp, outfp, current_offset, count, &bytes_read);
+        fdrop(outfp, td);
+	}
+
+	if (error != 0) {
+        uprintf("Drop\n");
 		goto drop;
+    }
+
 	current_offset += bytes_read;
 
 	if (offset != NULL) {
@@ -2027,6 +2191,8 @@ linux_sendfile_common(struct thread *td, l_int out, l_int in,
 	td->td_retval[0] = (ssize_t)bytes_read;
 drop:
 	fdrop(fp, td);
+	if (error == ENOTSOCK)
+		error = EINVAL;
 	return (error);
 }
 
@@ -2039,7 +2205,8 @@ linux_sendfile(struct thread *td, struct linux_sendfile_args *arg)
 	 *   mean send the whole file.)  In linux_sendfile given fds are still
 	 *   checked for validity when the count is 0.
 	 * - Linux can send to any fd whereas FreeBSD only supports sockets.
-	 *   The same restriction follows for linux_sendfile.
+	 *   We therefore use FreeBSD sendfile where possible for performance,
+     *   but fall back on a manual copy (_sendfile_fallback)
 	 * - Linux doesn't have an equivalent for FreeBSD's flags and sf_hdtr.
 	 * - Linux takes an offset pointer and updates it to the read location.
 	 *   FreeBSD takes in an offset and a 'bytes read' parameter which is
@@ -2078,6 +2245,7 @@ linux_sendfile(struct thread *td, struct linux_sendfile_args *arg)
 
 	return (ret);
 }
+
 
 #if defined(__i386__) || defined(__arm__) || \
     (defined(__amd64__) && defined(COMPAT_LINUX32))
